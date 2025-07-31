@@ -8,10 +8,10 @@
 #include <time.h>
 
 // WiFi and Firebase Configuration
-#define WIFI_SSID "Bash"
-#define WIFI_PASSWORD "@@impactbash!!"
-#define DATABASE_URL "https://smartberry-2526c-default-rtdb.firebaseio.com/"
-#define DATABASE_SECRET "kuXHOYkLJPhen4CJ5ZOqIkqwD1S1iyj7nHW3Ypak"
+#define WIFI_SSID ""
+#define WIFI_PASSWORD ""
+#define DATABASE_URL "https://...rtdb.firebaseio.com/"
+#define DATABASE_SECRET "kuX"
 
 // Sensor Configuration
 #define SENSOR_PIN 36
