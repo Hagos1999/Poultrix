@@ -1,0 +1,319 @@
+#include <Wire.h>
+#include "Zanshin_BME680.h"
+#include <LTR390.h>
+#include <TimeLib.h>
+#include <SensirionI2CScd4x.h>
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+#include <time.h>
+
+// WiFi and Firebase Configuration
+#define WIFI_SSID "Bash"
+#define WIFI_PASSWORD "@@impactbash!!"
+#define DATABASE_URL "https://smartberry-2526c-default-rtdb.firebaseio.com/"
+#define DATABASE_SECRET "kuXHOYkLJPhen4CJ5ZOqIkqwD1S1iyj7nHW3Ypak"
+
+// Sensor Configuration
+#define SENSOR_PIN 36
+#define READING_DELAY 100
+#define NUM_SAMPLES 10
+#define MIN_VALUE 1680
+#define MAX_VALUE 2400
+#define LTR390_I2C_ADDRESS 0x53
+
+// Timing Constants
+const uint32_t SERIAL_SPEED = 115200;
+const int MOVING_AVG_WINDOW = 5;
+const float ALPHA = 0.1;
+const unsigned long LOG_INTERVAL = 4000;
+const unsigned long SENSOR_READ_INTERVAL = 2000;
+
+// Filter Classes
+class MovingAverageFilter {
+private:
+    float buffer[5];
+    int index = 0;
+    bool filled = false;
+
+public:
+    float filter(float value) {
+        buffer[index] = value;
+        index = (index + 1) % 5;
+        if (index == 0) filled = true;
+
+        float sum = 0;
+        int count = filled ? 5 : index;
+        for (int i = 0; i < count; i++) {
+            sum += buffer[i];
+        }
+        return sum / count;
+    }
+};
+
+class LowPassFilter {
+private:
+    float lastValue = 0;
+    bool initialized = false;
+
+public:
+    float filter(float value) {
+        if (!initialized) {
+            lastValue = value;
+            initialized = true;
+            return value;
+        }
+        lastValue = ALPHA * value + (1 - ALPHA) * lastValue;
+        return lastValue;
+    }
+};
+
+class MoistureSensor {
+private:
+    int readings[NUM_SAMPLES];
+    int readIndex = 0;
+    long total = 0;
+
+public:
+    void begin() {
+        pinMode(SENSOR_PIN, INPUT);
+        total = 0;
+        for (int i = 0; i < NUM_SAMPLES; i++) {
+            readings[i] = analogRead(SENSOR_PIN);
+            total += readings[i];
+            delay(10);
+        }
+    }
+
+    int getMoisturePercentage() {
+        total -= readings[readIndex];
+        readings[readIndex] = analogRead(SENSOR_PIN);
+        total += readings[readIndex];
+        readIndex = (readIndex + 1) % NUM_SAMPLES;
+        
+        float avgReading = total / float(NUM_SAMPLES);
+        avgReading = constrain(avgReading, MIN_VALUE, MAX_VALUE);
+        return map(avgReading, MIN_VALUE, MAX_VALUE, 100, 0);
+    }
+};
+
+// Global variables
+unsigned long lastLogTime = 0;
+unsigned long lastSensorRead = 0;
+float scd4x_temp = 0;
+float scd4x_humidity = 0;
+
+// Sensor Instances
+BME680_Class BME680;
+LTR390 ltr390(LTR390_I2C_ADDRESS);
+SensirionI2CScd4x scd4x;
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Filter Instances
+MovingAverageFilter tempFilter;
+MovingAverageFilter humFilter;
+MovingAverageFilter pressureFilter;
+LowPassFilter gasFilter;
+MovingAverageFilter luxFilter;
+MovingAverageFilter uviFilter;
+MovingAverageFilter co2Filter;
+MoistureSensor moistureSensor;
+
+struct SensorData {
+    // BME680
+    float bme680_temperature;
+    float bme680_humidity;
+    float bme680_pressure;
+    float bme680_gas;
+    
+    // SCD4x
+    float scd41_temperature;
+    float scd41_humidity;
+    uint16_t scd41_co2;
+    
+    // Other sensors
+    float lux;
+    float uvi;
+    int moisture;
+    
+    // Filtered values
+    float filteredTemp;
+    float filteredHum;
+    float filteredPressure;
+    float filteredGas;
+    float filteredLux;
+    float filteredUvi;
+    float filteredCo2;
+    int filteredMoisture;
+    
+    char timestamp[25];
+};
+
+void setupWiFi() {
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(300);
+    }
+    configTime(0, 0, "pool.ntp.org");
+}
+
+void setupFirebase() {
+    config.database_url = DATABASE_URL;
+    config.signer.tokens.legacy_token = DATABASE_SECRET;
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
+}
+
+bool checkI2C() {
+    byte error;
+    int deviceCount = 0;
+    for (byte address = 1; address < 127; address++) {
+        Wire.beginTransmission(address);
+        error = Wire.endTransmission();
+        if (error == 0) {
+            deviceCount++;
+        }
+    }
+    return deviceCount > 0;
+}
+
+void logToFirebase(const SensorData& data) {
+    if (millis() - lastLogTime < LOG_INTERVAL) return;
+    
+    char path[64];
+    snprintf(path, sizeof(path), "/sensor_data/%s", data.timestamp);
+
+    FirebaseJson json;
+    json.add("bme680_temperature", String(data.bme680_temperature, 2));
+    json.add("bme680_humidity", String(data.bme680_humidity, 2));
+    json.add("bme680_pressure", String(data.bme680_pressure, 1));
+    json.add("bme680_gas_resistance", String(data.bme680_gas, 0));
+    
+    json.add("scd41_temperature", String(data.scd41_temperature, 2));
+    json.add("scd41_humidity", String(data.scd41_humidity, 2));
+    json.add("scd41_co2", String(data.filteredCo2, 0));
+    
+    json.add("ltr390_lux", String(data.filteredLux, 2));
+    json.add("ltr390_uvi", String(data.filteredUvi, 3));
+    json.add("soil_moisture", data.filteredMoisture);
+    json.add("timestamp", data.timestamp);
+
+    if (Firebase.setJSON(fbdo, path, json)) {
+        lastLogTime = millis();
+    }
+}
+
+// Add this function before loop()
+void printSensorData(const SensorData& data) {
+    Serial.println("\n=== Sensor Readings ===");
+    Serial.printf("Time: %s\n\n", data.timestamp);
+    
+    Serial.println("BME680:");
+    Serial.printf("  Temperature: %.2f°C\n", data.bme680_temperature);
+    Serial.printf("  Humidity: %.2f%%\n", data.bme680_humidity);
+    Serial.printf("  Pressure: %.1f hPa\n", data.bme680_pressure);
+    Serial.printf("  Gas: %.0f Ω\n\n", data.bme680_gas);
+    
+    Serial.println("SCD41:");
+    Serial.printf("  Temperature: %.2f°C\n", data.scd41_temperature);
+    Serial.printf("  Humidity: %.2f%%\n", data.scd41_humidity);
+    Serial.printf("  CO2: %.0f ppm\n\n", data.filteredCo2);
+    
+    Serial.println("Other Sensors:");
+    Serial.printf("  Light: %.2f lux\n", data.filteredLux);
+    Serial.printf("  UV Index: %.3f\n", data.filteredUvi);
+    Serial.printf("  Soil Moisture: %d%%\n", data.filteredMoisture);
+    Serial.println("==================\n");
+}
+
+void setup() {
+    Serial.begin(SERIAL_SPEED);
+    Wire.begin();
+    delay(100);
+    
+    if (!BME680.begin(I2C_STANDARD_MODE)) {
+        Serial.println("BME680 init failed!");
+        delay(1000);
+        ESP.restart();
+    }
+    
+    BME680.setOversampling(TemperatureSensor, Oversample16);
+    BME680.setOversampling(HumiditySensor, Oversample16);
+    BME680.setOversampling(PressureSensor, Oversample16);
+    BME680.setIIRFilter(IIR4);
+    BME680.setGas(320, 150);
+    
+    if (!ltr390.init()) {
+        Serial.println("LTR390 init failed!");
+        delay(1000);
+        ESP.restart();
+    }
+    
+    ltr390.setMode(LTR390_MODE_ALS);
+    ltr390.setGain(LTR390_GAIN_3);
+    ltr390.setResolution(LTR390_RESOLUTION_18BIT);
+    
+    scd4x.begin(Wire);
+    scd4x.startPeriodicMeasurement();
+    
+    moistureSensor.begin();
+    setupWiFi();
+    setupFirebase();
+}
+
+void loop() {
+    if (millis() - lastSensorRead < SENSOR_READ_INTERVAL) return;
+    lastSensorRead = millis();
+
+    if (!checkI2C()) {
+        Wire.begin();
+        delay(100);
+        return;
+    }
+
+    SensorData data;
+    static int32_t temp, humidity, pressure, gas;
+    
+    struct tm timeinfo;
+    if(getLocalTime(&timeinfo)) {
+        strftime(data.timestamp, sizeof(data.timestamp), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    }
+    
+    BME680.getSensorData(temp, humidity, pressure, gas);
+    data.bme680_temperature = (float)temp / 100.0;
+    data.bme680_humidity = (float)humidity / 1000.0;
+    data.bme680_pressure = (float)pressure / 100.0;
+    data.bme680_gas = (float)gas / 100.0;
+    
+    if (ltr390.newDataAvailable()) {
+        if (ltr390.getMode() == LTR390_MODE_ALS) {
+            data.lux = ltr390.getLux();
+            ltr390.setMode(LTR390_MODE_UVS);
+        } else {
+            data.uvi = ltr390.getUVI();
+            ltr390.setMode(LTR390_MODE_ALS);
+        }
+    }
+    
+    uint16_t co2;
+    if (scd4x.readMeasurement(co2, scd4x_temp, scd4x_humidity) == 0) {
+        data.scd41_co2 = co2;
+        data.scd41_temperature = scd4x_temp;
+        data.scd41_humidity = scd4x_humidity;
+    }
+    
+    //data.moisture = moistureSensor.getMoisturePercentage();
+    
+    data.filteredTemp = tempFilter.filter(data.bme680_temperature);
+    data.filteredHum = humFilter.filter(data.bme680_humidity);
+    data.filteredPressure = pressureFilter.filter(data.bme680_pressure);
+    data.filteredGas = gasFilter.filter(data.bme680_gas);
+    data.filteredLux = luxFilter.filter(data.lux);
+    data.filteredUvi = uviFilter.filter(data.uvi);
+    data.filteredCo2 = co2Filter.filter(data.scd41_co2);
+    data.filteredMoisture = data.moisture;
+    
+    printSensorData(data);
+    logToFirebase(data);
+} 
